@@ -34,6 +34,7 @@ contract ChainWarzLottery is ReentrancyGuard, VRFConsumerBase, Ownable {
     uint256 internal fee; // fee paid in LINK to chainlink. 0.1 on testnet, 2 on mainnet
 
     address payable public treasuryWallet;
+    address payable public weeklyJackpotWallet;
     address public operatorAddress;
     address public injectorAddress;
 
@@ -134,7 +135,8 @@ contract ChainWarzLottery is ReentrancyGuard, VRFConsumerBase, Ownable {
         uint256 currentSize,
         uint256 priceStructureId
     );
-    event FreeEntry(uint256 indexed battleId, address[] buyer, uint256 amount, uint256 currentSize);
+    event FreeEntry(uint256 _battleId, address[] _players, uint[] _numEntries, uint256 validPlayersCount, uint256 currentSize);
+    
     event BattleCancelled(uint256 indexed battleId, uint256 amountCollected);
     event PrizeTransferred(
         uint256 indexed battleId,
@@ -249,56 +251,43 @@ contract ChainWarzLottery is ReentrancyGuard, VRFConsumerBase, Ownable {
 
     // The operator can add free entries to the battle
     /// @param _battleId Id of the battle
-    /// @param _freePlayers array of addresses corresponding to the wallet of the users that won a free entrie
+    /// @param _players array of addresses corresponding to the wallet of the users that won a free entrie
+    /// @param _numEntries number of entries for players
     /// @dev only operator can make this call. Assigns a single entry per user, except if that user already reached the max limit of entries per user
     function giveBatchEntriesForFree(
         uint256 _battleId,
-        address[] memory _freePlayers
+        address[] memory _players,
+        uint256[] memory _numEntries
     ) external nonReentrant onlyOperator {
-        require(battles[_battleId].status == Status.Open, "Battle is not in accepted");
+        require(battles[_battleId].status == Status.Open, "Battle not Open");
 
-        uint256 freePlayersLength = _freePlayers.length;
-        uint256 validPlayersCount = 0;
-        for (uint256 i = 0; i < freePlayersLength; i++) {
-            address entry = _freePlayers[i];
+        uint256 numPlayers = _players.length;
+        uint256 validPlayersCount;
+        for (uint256 i = 0; i < numPlayers; i++) {
+            address player = _players[i];
+            uint256 numEntries = _numEntries[i];
 
-             if (
-                battles[_battleId].maxEntries == 0 
-            ) {
-                // add a new element to the entriesBought array.
-                // as this method only adds 1 entry per call, the amountbought is always 1
-                EntriesBought memory entryBought = EntriesBought({
-                    player: entry,
-                    currentEntriesLength: battles[_battleId].entriesLength + i + 1
-                });
-                entriesList[_battleId].push(entryBought);
+            for (uint256 j = 0; j < numEntries; j++) {
+                if (
+                    battles[_battleId].maxEntries == 0 ||
+                    claimsData[keccak256(abi.encode(player, _battleId))].numEntriesPerUser + 1 <= battles[_battleId].maxEntries
+                ) {
+                    EntriesBought memory entryBought = EntriesBought({
+                        player: player,
+                        currentEntriesLength: battles[_battleId].entriesLength + j + 1
+                    });
+                    entriesList[_battleId].push(entryBought);
 
-                claimsData[keccak256(abi.encode(entry, _battleId))].numEntriesPerUser++;
-
-                ++validPlayersCount;
-            } else if (
-                battles[_battleId].maxEntries > 0 &&
-                claimsData[keccak256(abi.encode(entry, _battleId))].numEntriesPerUser + 1 <=
-                battles[_battleId].maxEntries
-            ) {
-
-                EntriesBought memory entryBought = EntriesBought({
-                    player: entry,
-                    currentEntriesLength: battles[_battleId].entriesLength + i + 1
-                });
-                entriesList[_battleId].push(entryBought);
-
-                claimsData[keccak256(abi.encode(entry, _battleId))].numEntriesPerUser++;
-
-                ++validPlayersCount;
+                    claimsData[keccak256(abi.encode(player, _battleId))].numEntriesPerUser++;
+                    validPlayersCount++;
+                }
             }
         }
 
         battles[_battleId].entriesLength = battles[_battleId].entriesLength + validPlayersCount;
 
-        emit FreeEntry(_battleId, _freePlayers, freePlayersLength, battles[_battleId].entriesLength);
+        emit FreeEntry(_battleId, _players, _numEntries, validPlayersCount, battles[_battleId].entriesLength);
     }
-
 
     /// @param _maxEntriesPerUser To avoid whales, the number of entries an user can have is limited
     /// @param _prices Array of prices and amount of entries the customer could purchase
@@ -352,13 +341,13 @@ contract ChainWarzLottery is ReentrancyGuard, VRFConsumerBase, Ownable {
         return battles.length - 1;
     }
 
-    /* * Example of a price structure:
-    1 ticket 0.02
-    5 tickets 0.018 (10% discount)
-    10 tickets 0.16  (20% discount)
-    25 tickets 0.35  (30% discount) 
-    50 tickets 0.6 (40% discount)
-*/
+    /** Example of a price structure:
+        1 ticket 0.02
+        5 tickets 0.018 (10% discount)
+        10 tickets 0.16  (20% discount)
+        25 tickets 0.35  (30% discount) 
+        50 tickets 0.6 (40% discount)
+    */
     /// @param _battleId battleId
     /// @param _priceId Id of the price structure
     /// @return the price structure of that particular Id + battle
@@ -502,11 +491,15 @@ contract ChainWarzLottery is ReentrancyGuard, VRFConsumerBase, Ownable {
 
         // * Stakers
         (bool sent, ) = stakersAddress.call{value: _stakersReward}("");
-        require(sent, "Failed to send Ether");
+        require(sent, "Failed send Eth to stakersAddress");
 
-        // * Platform + Weekly jackpot
-        (bool sent2, ) = treasuryWallet.call{value: (treasuryFee + weeklyJackpotBattle)}("");
-        require(sent2, "Failed send Eth to MW");
+        // * Platform
+        (bool sent2, ) = treasuryWallet.call{value: treasuryFee}("");
+        require(sent2, "Failed send Eth to treasuryWallet");
+
+        // * Weekly jackpot
+        (bool sent3, ) = weeklyJackpotWallet.call{value: weeklyJackpotBattle}("");
+        require(sent3, "Failed send Eth to weeklyJackpotWallet");
 
         (bool sentPrize, ) = battle.winner.call{value: winnerPrize}("");
         require(sentPrize, "Failed to send Prize Ether");
